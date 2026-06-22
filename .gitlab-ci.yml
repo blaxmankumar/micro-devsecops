@@ -1,60 +1,55 @@
 stages:
-  - build
-  - test
   - scan
+  - test
+  - build
   - docker
-  - deploy
+  - security
+  - push
 
 variables:
-  MAVEN_OPTS: "-Dmaven.repo.local=.m2/repository"
+  IMAGE_NAME: "$DOCKER_USERNAME/springboot-app"
 
 cache:
   paths:
     - .m2/repository
-    - .gradle/caches
-    - .gradle/wrapper
 
-build-maven:
-  stage: build
-  image: maven:3.8.6-openjdk-18
-  script:
-    - for service in api-gateway user-service order-service inventory-service; do cd $service && mvn compile && cd ..; done
-
-build-gradle:
-  stage: build
-  image: gradle:7.5.1-jdk17
-  script:
-    - for service in product-service cart-service payment-service notification-service; do cd $service && chmod +x gradlew && ./gradlew compileJava && cd ..; done
-
-test-maven:
-  stage: test
-  image: maven:3.8.6-openjdk-18
-  script:
-    - for service in api-gateway user-service order-service inventory-service; do cd $service && mvn test && cd ..; done
-
-test-gradle:
-  stage: test
-  image: gradle:7.5.1-jdk17
-  script:
-    - for service in product-service cart-service payment-service notification-service; do cd $service && chmod +x gradlew && ./gradlew test && cd ..; done
-
-security-scan:
+sonarqube:
   stage: scan
-  image: maven:3.8.6-openjdk-18
+  image: maven:3.9-eclipse-temurin-17
   script:
-    - echo "Running security scan / SonarQube / OWASP analysis..."
+    - mvn clean verify sonar:sonar
+      -Dsonar.host.url=$SONAR_HOST_URL
+      -Dsonar.token=$SONAR_TOKEN
+  only:
+    - main
+
+unit-test:
+  stage: test
+  image: maven:3.9-eclipse-temurin-17
+  script:
+    - mvn test
+
+build:
+  stage: build
+  image: maven:3.9-eclipse-temurin-17
+  script:
+    - mvn clean package -DskipTests
+  artifacts:
+    paths:
+      - target/*.jar
 
 docker-build:
   stage: docker
-  image: docker:20.10.16
-  services:
-    - docker:20.10.16-dind
   script:
-    - echo "Building and pushing docker images..."
+    - docker build -t $IMAGE_NAME:$CI_COMMIT_SHORT_SHA .
 
-k8s-deploy:
-  stage: deploy
-  image: bitnami/kubectl:latest
+trivy-scan:
+  stage: security
   script:
-    - echo "Deploying to Kubernetes namespace ecommerce-devops..."
-    # - kubectl apply -f k8s/
+    - trivy image $IMAGE_NAME:$CI_COMMIT_SHORT_SHA
+
+docker-push:
+  stage: push
+  script:
+    - echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+    - docker push $IMAGE_NAME:$CI_COMMIT_SHORT_SHA
