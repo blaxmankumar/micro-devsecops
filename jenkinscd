@@ -1,0 +1,641 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        skipDefaultCheckout(true)
+    }
+
+    environment {
+        AWS_REGION           = 'us-east-2'
+        EKS_CLUSTER          = 'micro-devsecops-eks'
+
+        ARGOCD_NAMESPACE     = 'argocd'
+        ARGOCD_MANIFEST_URL  = 'https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml'
+
+        GIT_REPO             = 'https://github.com/blaxmankumar/micro-devsecops.git'
+        GIT_BRANCH           = 'main'
+        MANIFEST_PATH        = 'k8s'
+
+        APP_NAMESPACE        = 'ecommerce-devops'
+        ARGO_APP_NAME        = 'ecommerce-app'
+
+        FRONTEND_SERVICE     = 'frontend'
+
+        ZAP_DOCKER_IMAGE     = 'ghcr.io/zaproxy/zaproxy:stable'
+        ZAP_REPORT_DIR       = 'reports/zap'
+
+        NEXUS_URL            = 'http://localhost:8081'
+        NEXUS_REPOSITORY     = 'devsecops-repository'
+        NEXUS_REPORT_PATH    = 'ecommerce-devops/dast/zap'
+        NEXUS_CREDENTIALS_ID = 'nexus-creds'
+
+        KUBECONFIG           = "${WORKSPACE}/.kube/config"
+    }
+
+    stages {
+
+        stage('Clone Repository') {
+            steps {
+                git branch: "${GIT_BRANCH}", url: "${GIT_REPO}"
+            }
+        }
+
+        stage('Check Required Tools') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "Checking required tools..."
+
+                    command -v aws
+                    command -v kubectl
+                    command -v docker
+                    command -v curl
+
+                    echo "AWS CLI:"
+                    aws --version
+
+                    echo "Kubectl:"
+                    kubectl version --client=true
+
+                    echo "Docker:"
+                    docker --version
+
+                    echo "Required tools are available."
+                '''
+            }
+        }
+
+        stage('Connect to EKS Cluster') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'aws-creds',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                ]) {
+                    sh '''
+                        set -e
+
+                        mkdir -p "$(dirname "$KUBECONFIG")"
+
+                        echo "Checking AWS identity..."
+                        aws sts get-caller-identity
+
+                        echo "Updating kubeconfig for EKS cluster..."
+                        aws eks update-kubeconfig \
+                          --region "$AWS_REGION" \
+                          --name "$EKS_CLUSTER" \
+                          --kubeconfig "$KUBECONFIG"
+
+                        echo "Checking Kubernetes cluster connection..."
+                        kubectl cluster-info
+                        kubectl get nodes -o wide
+                    '''
+                }
+            }
+        }
+
+        stage('Ensure Application Namespace and StorageClass') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "Creating application namespace if missing..."
+                    kubectl create namespace "$APP_NAMESPACE" \
+                      --dry-run=client \
+                      -o yaml | kubectl apply -f -
+
+                    echo "Ensuring gp3 StorageClass exists for EKS EBS PVC..."
+                    cat <<EOF | kubectl apply -f -
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+parameters:
+  type: gp3
+EOF
+
+                    echo "StorageClasses:"
+                    kubectl get storageclass
+                '''
+            }
+        }
+
+        stage('Install or Repair Argo CD') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "Creating Argo CD namespace if missing..."
+                    kubectl create namespace "$ARGOCD_NAMESPACE" \
+                      --dry-run=client \
+                      -o yaml | kubectl apply -f -
+
+                    echo "Installing/repairing Argo CD..."
+                    kubectl apply -n "$ARGOCD_NAMESPACE" \
+                      --server-side \
+                      --force-conflicts \
+                      -f "$ARGOCD_MANIFEST_URL"
+
+                    echo "Waiting for Argo CD CRDs..."
+                    kubectl wait --for=condition=Established \
+                      crd/applications.argoproj.io \
+                      --timeout=180s
+
+                    kubectl wait --for=condition=Established \
+                      crd/appprojects.argoproj.io \
+                      --timeout=180s
+
+                    kubectl wait --for=condition=Established \
+                      crd/applicationsets.argoproj.io \
+                      --timeout=180s || true
+
+                    echo "Waiting for Argo CD components..."
+
+                    kubectl rollout status deployment/argocd-server \
+                      -n "$ARGOCD_NAMESPACE" \
+                      --timeout=300s
+
+                    kubectl rollout status deployment/argocd-repo-server \
+                      -n "$ARGOCD_NAMESPACE" \
+                      --timeout=300s
+
+                    kubectl rollout status deployment/argocd-redis \
+                      -n "$ARGOCD_NAMESPACE" \
+                      --timeout=300s
+
+                    kubectl rollout status statefulset/argocd-application-controller \
+                      -n "$ARGOCD_NAMESPACE" \
+                      --timeout=300s
+
+                    kubectl rollout status deployment/argocd-dex-server \
+                      -n "$ARGOCD_NAMESPACE" \
+                      --timeout=300s || true
+
+                    kubectl rollout status deployment/argocd-applicationset-controller \
+                      -n "$ARGOCD_NAMESPACE" \
+                      --timeout=300s || true
+
+                    kubectl rollout status deployment/argocd-notifications-controller \
+                      -n "$ARGOCD_NAMESPACE" \
+                      --timeout=300s || true
+
+                    echo "Argo CD pods:"
+                    kubectl get pods -n "$ARGOCD_NAMESPACE" -o wide
+
+                    echo "Argo CD services:"
+                    kubectl get svc -n "$ARGOCD_NAMESPACE"
+                '''
+            }
+        }
+
+        stage('Create Argo CD Application Using Raw Manifests') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "Creating Argo CD Application for raw Kubernetes manifests..."
+                    echo "Repo: $GIT_REPO"
+                    echo "Branch: $GIT_BRANCH"
+                    echo "Path: $MANIFEST_PATH"
+
+                    cat <<EOF | kubectl apply -f -
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: $ARGO_APP_NAME
+  namespace: $ARGOCD_NAMESPACE
+spec:
+  project: default
+
+  source:
+    repoURL: $GIT_REPO
+    targetRevision: $GIT_BRANCH
+    path: $MANIFEST_PATH
+    directory:
+      recurse: true
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: $APP_NAMESPACE
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+EOF
+
+                    echo "Argo CD Application created/updated."
+                    kubectl get application "$ARGO_APP_NAME" -n "$ARGOCD_NAMESPACE"
+                '''
+            }
+        }
+
+        stage('Wait for Argo CD Sync') {
+            steps {
+                sh '''
+                    set +e
+
+                    echo "Waiting for Argo CD application to sync..."
+
+                    for i in $(seq 1 60); do
+                        SYNC_STATUS=$(kubectl get application "$ARGO_APP_NAME" -n "$ARGOCD_NAMESPACE" -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")
+                        HEALTH_STATUS=$(kubectl get application "$ARGO_APP_NAME" -n "$ARGOCD_NAMESPACE" -o jsonpath='{.status.health.status}' 2>/dev/null || echo "Unknown")
+
+                        echo "Attempt $i: sync=$SYNC_STATUS health=$HEALTH_STATUS"
+
+                        if [ "$SYNC_STATUS" = "Synced" ]; then
+                            echo "Argo CD application is Synced."
+                            exit 0
+                        fi
+
+                        sleep 10
+                    done
+
+                    echo "Argo CD application did not become Synced in expected time."
+                    kubectl describe application "$ARGO_APP_NAME" -n "$ARGOCD_NAMESPACE" || true
+                    exit 1
+                '''
+            }
+        }
+
+        stage('Wait for E-Commerce Deployments') {
+            steps {
+                sh '''
+                    set +e
+
+                    echo "Waiting for ecommerce deployments..."
+
+                    deployments="postgres api-gateway user-service product-service cart-service order-service payment-service inventory-service notification-service frontend"
+
+                    for deployment in $deployments; do
+                        echo "Waiting for deployment: $deployment"
+
+                        kubectl rollout status deployment/"$deployment" \
+                          -n "$APP_NAMESPACE" \
+                          --timeout=300s
+
+                        STATUS=$?
+
+                        if [ $STATUS -ne 0 ]; then
+                            echo "Deployment failed or timed out: $deployment"
+                            kubectl describe deployment "$deployment" -n "$APP_NAMESPACE" || true
+                            kubectl get pods -n "$APP_NAMESPACE" || true
+                            exit 1
+                        fi
+                    done
+
+                    echo "All deployments are ready."
+
+                    echo "Pods:"
+                    kubectl get pods -n "$APP_NAMESPACE" -o wide
+
+                    echo "Services:"
+                    kubectl get svc -n "$APP_NAMESPACE"
+
+                    echo "PVC:"
+                    kubectl get pvc -n "$APP_NAMESPACE" || true
+                '''
+            }
+        }
+
+        stage('Detect Frontend URL') {
+            steps {
+                sh '''
+                    set +e
+
+                    mkdir -p "$ZAP_REPORT_DIR"
+
+                    echo "Detecting frontend service URL..."
+
+                    FRONTEND_HOST=$(kubectl get svc "$FRONTEND_SERVICE" -n "$APP_NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+                    FRONTEND_IP=$(kubectl get svc "$FRONTEND_SERVICE" -n "$APP_NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+                    FRONTEND_TYPE=$(kubectl get svc "$FRONTEND_SERVICE" -n "$APP_NAMESPACE" -o jsonpath='{.spec.type}' 2>/dev/null)
+
+                    TARGET_URL=""
+
+                    if [ -n "$FRONTEND_HOST" ]; then
+                        TARGET_URL="http://$FRONTEND_HOST"
+                    elif [ -n "$FRONTEND_IP" ]; then
+                        TARGET_URL="http://$FRONTEND_IP"
+                    fi
+
+                    echo "$TARGET_URL" > "$ZAP_REPORT_DIR/target-url.txt"
+
+                    echo "Frontend service type: $FRONTEND_TYPE"
+                    echo "Detected target URL: $TARGET_URL"
+
+                    if [ -z "$TARGET_URL" ]; then
+                        echo "No LoadBalancer URL found."
+                        echo "If frontend service is ClusterIP, expose it manually or change frontend.yml service type to LoadBalancer."
+                    fi
+
+                    kubectl get svc "$FRONTEND_SERVICE" -n "$APP_NAMESPACE" -o wide
+                '''
+            }
+        }
+
+        stage('Show Argo CD Access Commands') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "=============================================="
+                    echo "Argo CD installed successfully on EKS."
+                    echo "Raw Kubernetes manifests are deployed from GitHub."
+                    echo ""
+                    echo "Argo CD namespace: $ARGOCD_NAMESPACE"
+                    echo "Application namespace: $APP_NAMESPACE"
+                    echo ""
+                    echo "To access Argo CD UI:"
+                    echo ""
+                    echo "kubectl port-forward --address 0.0.0.0 svc/argocd-server -n argocd 8088:443"
+                    echo ""
+                    echo "Then open:"
+                    echo "https://YOUR_EC2_PUBLIC_IP:8088"
+                    echo ""
+                    echo "Username:"
+                    echo "admin"
+                    echo ""
+                    echo "Password command:"
+                    echo "kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d; echo"
+                    echo ""
+                    echo "Check Argo CD app:"
+                    echo "kubectl get applications -n argocd"
+                    echo ""
+                    echo "Check ecommerce app:"
+                    echo "kubectl get pods -n ecommerce-devops"
+                    echo "kubectl get svc -n ecommerce-devops"
+                    echo "=============================================="
+                '''
+            }
+        }
+
+        stage('Light Application Check Before DAST') {
+            steps {
+                sh '''
+                    set +e
+
+                    TARGET_URL=$(cat "$ZAP_REPORT_DIR/target-url.txt" 2>/dev/null || echo "")
+
+                    echo "=============================================="
+                    echo "Light application availability check"
+                    echo "Target URL: $TARGET_URL"
+                    echo "=============================================="
+
+                    mkdir -p "$ZAP_REPORT_DIR"
+                    chmod -R 777 "$ZAP_REPORT_DIR"
+
+                    CHECK_REPORT="$ZAP_REPORT_DIR/application-url-check.txt"
+
+                    {
+                        echo "DAST Target URL: $TARGET_URL"
+                        echo "Build Number: $BUILD_NUMBER"
+                        echo "Check Time: $(date)"
+                        echo ""
+                        echo "Checking application reachability..."
+                    } > "$CHECK_REPORT"
+
+                    if [ -z "$TARGET_URL" ]; then
+                        echo "No public frontend URL detected. Skipping ZAP scan."
+                        echo "Result: No public frontend URL detected. ZAP scan skipped." >> "$CHECK_REPORT"
+
+                        cat > "$ZAP_REPORT_DIR/zap-scan-skipped-report.md" <<EOF
+# ZAP DAST Scan Skipped Report
+
+## Reason
+No public frontend URL was detected.
+
+## Current frontend service
+$(kubectl get svc "$FRONTEND_SERVICE" -n "$APP_NAMESPACE" -o wide 2>/dev/null || true)
+
+## Fix
+Change frontend service type to LoadBalancer in k8s/frontend.yml, push to GitHub, and let Argo CD sync.
+
+## Build
+Jenkins Build Number: $BUILD_NUMBER
+
+## Time
+$(date)
+EOF
+                        exit 0
+                    fi
+
+                    APP_READY="false"
+
+                    for i in $(seq 1 10); do
+                        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 "$TARGET_URL" || echo "000")
+
+                        echo "Attempt $i: HTTP status code = $HTTP_CODE"
+                        echo "Attempt $i: HTTP status code = $HTTP_CODE" >> "$CHECK_REPORT"
+
+                        if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 500 ]; then
+                            APP_READY="true"
+                            break
+                        fi
+
+                        sleep 10
+                    done
+
+                    echo "" >> "$CHECK_REPORT"
+
+                    if [ "$APP_READY" = "true" ]; then
+                        echo "Application is reachable. ZAP scan can run."
+                        echo "Result: Application reachable. ZAP scan allowed." >> "$CHECK_REPORT"
+                        touch "$ZAP_REPORT_DIR/app_reachable"
+                    else
+                        echo "Application is not reachable. ZAP scan skipped."
+                        echo "Result: Application not reachable. ZAP scan skipped." >> "$CHECK_REPORT"
+
+                        cat > "$ZAP_REPORT_DIR/zap-scan-skipped-report.md" <<EOF
+# ZAP DAST Scan Skipped Report
+
+## Target
+$TARGET_URL
+
+## Reason
+Application was not reachable during Jenkins pipeline execution.
+
+## What to check
+- Frontend service type
+- LoadBalancer DNS
+- Security groups
+- Pod status
+- Application routing
+
+## Build
+Jenkins Build Number: $BUILD_NUMBER
+
+## Time
+$(date)
+EOF
+                    fi
+
+                    exit 0
+                '''
+            }
+        }
+
+        stage('Easy OWASP ZAP Report Scan') {
+            steps {
+                sh '''
+                    set +e
+
+                    TARGET_URL=$(cat "$ZAP_REPORT_DIR/target-url.txt" 2>/dev/null || echo "")
+
+                    echo "=============================================="
+                    echo "Starting easy OWASP ZAP baseline scan"
+                    echo "Target URL: $TARGET_URL"
+                    echo "=============================================="
+
+                    if [ ! -f "$ZAP_REPORT_DIR/app_reachable" ]; then
+                        echo "Application was not reachable or no URL found. Skipping ZAP scan."
+                        exit 0
+                    fi
+
+                    docker pull "$ZAP_DOCKER_IMAGE"
+
+                    docker run --rm \
+                      -v "$(pwd)/$ZAP_REPORT_DIR:/zap/wrk/:rw" \
+                      "$ZAP_DOCKER_IMAGE" \
+                      zap-baseline.py \
+                      -t "$TARGET_URL" \
+                      -m 1 \
+                      -r zap-light-report.html \
+                      -J zap-light-report.json \
+                      -w zap-light-report.md \
+                      -x zap-light-report.xml \
+                      -I
+
+                    ZAP_EXIT_CODE=$?
+
+                    cat > "$ZAP_REPORT_DIR/zap-scan-summary.txt" <<EOF
+OWASP ZAP Easy Scan Summary
+
+Target URL: $TARGET_URL
+Build Number: $BUILD_NUMBER
+Scan Type: Easy Baseline Passive Scan
+Spider Time: 1 minute
+Pipeline Failure On ZAP Findings: Disabled
+ZAP Exit Code: $ZAP_EXIT_CODE
+Scan Time: $(date)
+EOF
+
+                    echo "Generated ZAP reports:"
+                    ls -lah "$ZAP_REPORT_DIR"
+
+                    exit 0
+                '''
+            }
+        }
+
+        stage('Upload ZAP Reports to Nexus') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: "${NEXUS_CREDENTIALS_ID}",
+                        usernameVariable: 'NEXUS_USER',
+                        passwordVariable: 'NEXUS_PASS'
+                    )
+                ]) {
+                    sh '''
+                        set -e
+
+                        echo "Uploading ZAP reports to Nexus..."
+
+                        if [ ! -d "$ZAP_REPORT_DIR" ]; then
+                            mkdir -p "$ZAP_REPORT_DIR"
+                            echo "No ZAP reports generated for this build." > "$ZAP_REPORT_DIR/no-zap-report.txt"
+                        fi
+
+                        REPORT_COUNT=$(find "$ZAP_REPORT_DIR" -type f | wc -l | tr -d ' ')
+
+                        if [ "$REPORT_COUNT" = "0" ]; then
+                            echo "No ZAP reports generated for this build." > "$ZAP_REPORT_DIR/no-zap-report.txt"
+                        fi
+
+                        for file in "$ZAP_REPORT_DIR"/*; do
+                            if [ -f "$file" ]; then
+                                FILE_NAME=$(basename "$file")
+
+                                echo "Uploading: $FILE_NAME"
+
+                                curl -f -u "$NEXUS_USER:$NEXUS_PASS" \
+                                  --upload-file "$file" \
+                                  "$NEXUS_URL/repository/$NEXUS_REPOSITORY/$NEXUS_REPORT_PATH/$BUILD_NUMBER/$FILE_NAME"
+
+                                echo "Uploaded: $FILE_NAME"
+                            fi
+                        done
+
+                        echo "Nexus report location:"
+                        echo "$NEXUS_URL/repository/$NEXUS_REPOSITORY/$NEXUS_REPORT_PATH/$BUILD_NUMBER/"
+                    '''
+                }
+            }
+        }
+
+        stage('Archive ZAP Reports in Jenkins') {
+            steps {
+                archiveArtifacts artifacts: 'reports/zap/**', allowEmptyArchive: true
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'EKS connection, Argo CD installation, raw manifest GitOps deployment, ZAP report generation, and Nexus upload completed successfully.'
+        }
+
+        failure {
+            echo 'CD pipeline failed. Checking debug information...'
+
+            sh '''
+                set +e
+
+                echo "Argo CD pods:"
+                kubectl get pods -n "$ARGOCD_NAMESPACE" -o wide || true
+
+                echo "Argo CD applications:"
+                kubectl get applications -n "$ARGOCD_NAMESPACE" -o wide || true
+
+                echo "Application pods:"
+                kubectl get pods -n "$APP_NAMESPACE" -o wide || true
+
+                echo "Application services:"
+                kubectl get svc -n "$APP_NAMESPACE" || true
+
+                echo "Application PVC:"
+                kubectl get pvc -n "$APP_NAMESPACE" || true
+
+                echo "Application deployments:"
+                kubectl get deployments -n "$APP_NAMESPACE" || true
+
+                echo "Recent Argo CD events:"
+                kubectl get events -n "$ARGOCD_NAMESPACE" --sort-by=.lastTimestamp | tail -50 || true
+
+                echo "Recent application events:"
+                kubectl get events -n "$APP_NAMESPACE" --sort-by=.lastTimestamp | tail -50 || true
+
+                echo "ZAP report directory:"
+                ls -lah "$ZAP_REPORT_DIR" || true
+            '''
+        }
+
+        always {
+            echo 'Archiving ZAP reports if available...'
+            archiveArtifacts artifacts: 'reports/zap/**', allowEmptyArchive: true
+        }
+    }
+}
