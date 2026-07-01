@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
         - name: product-service
-          image: battulalaxmankumar04/product-service:latest
+          image: battulalaxmankumar04/product-service:4
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8082
